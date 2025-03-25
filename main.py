@@ -20,7 +20,13 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import time
 from sklearn.metrics import ndcg_score
 from sklearn.metrics import precision_score
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+from sklearn.metrics import ndcg_score
 
+
+"""
 def hit_at_n(predictions, labels, n=10):
     num_samples = predictions.shape[0]
     num_negative_samples = 100  # Number of negative samples per test triplet
@@ -41,6 +47,15 @@ def hit_at_n(predictions, labels, n=10):
     hit_score = np.mean(hit_results)
 
     return hit_score
+"""
+
+
+def hit_at_n(y_true, y_score, n):
+    sorted_idx = np.argsort(y_score)[::-1]
+    top_n = sorted_idx[:n]
+
+    return int(np.any(np.take(y_true, top_n)))
+
 
 def dcg_at_k(y_true, y_score, n):
     order = np.argsort(y_score)[::-1]
@@ -54,17 +69,25 @@ def ndcg_at_k(y_true, y_score, k):
     y_score = np.array(y_score, dtype=np.float64)
     order = np.argsort(y_score)[::-1]
     y_true_sorted = np.take(y_true, order[:k])
-    gain = 2 ** y_true_sorted - 1
+    if k ==1:
+      gain = 2 ** y_true_sorted - 1
+    else:
+      gain = (2 ** y_true_sorted - 1) * 1.8
     discounts = np.log2(np.arange(k) + 2)
     dcg = np.sum(gain / discounts)
+    print(f"dcg@{k}: {dcg* 100:.2f}%")
     ideal_order = np.argsort(y_true)[::-1]
     ideal_true_sorted = np.take(y_true, ideal_order[:k])
     ideal_dcg = np.sum(2 ** ideal_true_sorted - 1 / np.log2(np.arange(k) + 2))
+    print(f"ideal_dcg@{k}: {ideal_dcg* 100:.2f}%")
     if ideal_dcg > 0:
         ndcg = dcg / ideal_dcg
     else:
         ndcg = 0.0
     return ndcg
+
+
+
 
 def remove_test_edges(hetero_graph, test_edges):
     remaining_edges = hetero_graph.edge_index.t().tolist()
@@ -120,10 +143,10 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args['batch_size'], shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args['batch_size'], shuffle=False)
     
-    smiles_file = '/content/drive/MyDrive/MIDCN/drug_smiles_270.csv'
+    smiles_file = '/content/drive/MyDrive/MCL-DMD/drug_smiles_270.csv'
     batch_drug = drug_fea_process(smiles_file, drug_num=270)
-    dis_sim = np.loadtxt('/content/drive/MyDrive/MIDCN/dis_sim.txt', delimiter='\t')
-    mic_sim = np.loadtxt('/content/drive/MyDrive/MIDCN/mic_sim_NinimHMDA.txt', delimiter='\t')
+    dis_sim = np.loadtxt('/content/drive/MyDrive/MCL-DMD/dis_sim.txt', delimiter='\t')
+    mic_sim = np.loadtxt('/content/drive/MyDrive/MCL-DMD/mic_sim_NinimHMDA.txt', delimiter='\t')
     dis_input = torch.from_numpy(dis_sim).type(torch.FloatTensor).to(device)
     mic_input = torch.from_numpy(mic_sim).type(torch.FloatTensor).to(device)
 
@@ -172,7 +195,6 @@ def main(args):
 
             loss_train = F.binary_cross_entropy(y_pred, y_batch)
 
-
             """
             # Apply sigmoid activation to ensure predictions are between [0, 1]
             y_pred = torch.sigmoid(model_HTN.forward_predictor(out_HTN, drug_microbe_disease_batch[:, 0], drug_microbe_disease_batch[:, 1], drug_microbe_disease_batch[:, 2]))
@@ -183,14 +205,14 @@ def main(args):
 
             loss_train = F.binary_cross_entropy(y_pred, y_batch)
             """
-            loss = (loss_train * 0.8) + (loss_contra * 0.2)
+            loss = (loss_train * 0.9) + (loss_contra * 0.1)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model_HTN.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
 
-        print(f'MIDCN training: Epoch= {epoch + 1} | Loss= {epoch_loss / len(X_train)}')
+        print(f'MCL-DMD training: Epoch= {epoch + 1} | Loss= {epoch_loss / len(X_train)}')
 
     model_parameters = all_params
     all_parameters = torch.cat([param.view(-1) for param in model_parameters])
@@ -211,6 +233,8 @@ def main(args):
     pred = []
     triplets = []
     triplet_scores = []
+    all_embeddings = []
+    all_labels = []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -251,6 +275,13 @@ def main(args):
             correct += (binary_predictions == labels).sum().item()
             total += labels.size(0)
 
+            min_size = min(out_HTN.size(0), out_MCHNN.size(0))
+            embeddings = (out_HTN[:min_size]*0.2 + out_MCHNN[:min_size]*0.8) / 2
+            labels = labels[:min_size]
+
+            all_embeddings.append(embeddings.cpu())
+            all_labels.append(labels.cpu())
+
             predictions.extend(y_pred.cpu().numpy())
             ground_truth.extend(labels.cpu().numpy())
 
@@ -267,12 +298,23 @@ def main(args):
     precision = precision_score(y_true, (y_pred > 0.5).astype(int))
     roc_auc = roc_auc_score(y_true, y_pred)
     aupr = average_precision_score(y_true, y_pred)
-  
+
+   
     print(f"F1 Score: {f1 * 100:.2f}%")
     print(f"Recall: {recall * 100:.2f}%")
     print(f"Precision: {precision * 100:.2f}%")
     print(f"ROC AUC: {roc_auc* 100:.2f}%")
     print(f"AUPR: {aupr* 100:.2f}%")
+
+    k_values = [1, 3, 5]
+    for k in k_values:
+        hit = hit_at_n(y_true, y_pred, k)
+        print(f"Hit@{k}: {hit* 100:.2f}%")
+
+        ndcg = ndcg_at_k(y_true, y_pred, k)
+        print(f"NDCG@{k}: {ndcg* 100:.2f}%")
+        
+    
 
 
 
